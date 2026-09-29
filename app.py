@@ -461,6 +461,7 @@ def get_nifty_tri_history(index_name, start_date, end_date):
         # Nifty's response has used slightly different field names over time.
         for key in [
             "Total Returns Index",
+            "TotalReturnsIndex",
             "TotalReturnIndex",
             "TRI",
             "tri",
