@@ -393,35 +393,46 @@ BENCHMARKS = {
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def get_nifty_tri_history(index_name, start_date, end_date):
-    """Fetch official Nifty Total Return Index history."""
-    start_display = pd.Timestamp(start_date).strftime("%d-%b-%Y")
-    end_display = pd.Timestamp(end_date).strftime("%d-%b-%Y")
+def _get_nifty_tri_chunk(index_name, start_date, end_date):
+    """Fetch one Nifty TRI chunk. Nifty's endpoint is limited to about 365 days."""
+    start_display = pd.Timestamp(start_date).strftime("%d %b %Y")
+    end_display = pd.Timestamp(end_date).strftime("%d %b %Y")
 
     cinfo = (
-        "{'name':'"
-        + index_name
-        + "','startDate':'"
-        + start_display
-        + "','endDate':'"
-        + end_display
-        + "','indexName':'"
-        + index_name
-        + "'}"
+        "{'name':'" + index_name +
+        "','startDate':'" + start_display +
+        "','endDate':'" + end_display +
+        "','indexName':'" + index_name + "'}"
     )
 
     payload = {"cinfo": cinfo}
-
     headers = {
         "Accept": "application/json, text/javascript, */*; q=0.01",
         "Content-Type": "application/json; charset=UTF-8",
         "Origin": "https://www.niftyindices.com",
         "Referer": "https://www.niftyindices.com/reports/historical-data",
         "X-Requested-With": "XMLHttpRequest",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/154.0.0.0 Safari/537.36",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/154.0.0.0 Safari/537.36"
+        ),
     }
 
-    response = requests.post(
+    session = requests.Session()
+
+    # Bootstrap the Nifty site first. This helps when the hosting server
+    # requires the site cookie before accepting the AJAX endpoint.
+    try:
+        session.get(
+            "https://www.niftyindices.com/reports/historical-data",
+            headers={"User-Agent": headers["User-Agent"]},
+            timeout=30,
+        )
+    except Exception:
+        pass
+
+    response = session.post(
         NIFTY_TRI_URL,
         headers=headers,
         json=payload,
@@ -433,52 +444,44 @@ def get_nifty_tri_history(index_name, start_date, end_date):
     raw = outer.get("d", "[]")
 
     if isinstance(raw, str):
-        if raw.lower() == "false":
-            return None
-        records = json.loads(raw) if raw else []
+        if raw.lower() in ("false", "", "null"):
+            return pd.DataFrame(columns=["Date", "TRI"])
+        records = json.loads(raw)
     else:
         records = raw
 
-    if not records:
-        return None
-
     rows = []
-
-    for record in records:
+    for record in records or []:
         if not isinstance(record, dict):
             continue
 
-        date_value = None
+        date_value = (
+            record.get("Date")
+            or record.get("HistoricalDate")
+            or record.get("date")
+            or record.get("IndexDate")
+            or record.get("indexDate")
+        )
+
         tri_value = None
-
-        for key in [
-            "HistoricalDate", "Date", "date", "IndexDate", "indexDate"
-        ]:
-            if key in record and record[key] not in [None, ""]:
-                date_value = record[key]
-                break
-
-        # Nifty's response has used slightly different field names over time.
-        for key in [
-            "Total Returns Index",
+        for key in (
             "TotalReturnsIndex",
+            "Total Returns Index",
             "TotalReturnIndex",
             "TRI",
             "tri",
-            "Total Returns",
             "TRIValue",
             "TRIndex",
             "TRI_VALUE",
-        ]:
-            if key in record and record[key] not in [None, ""]:
+        ):
+            if key in record and record[key] not in (None, ""):
                 tri_value = record[key]
                 break
 
         if tri_value is None:
-            # Fallback: identify a field containing TR but not NTR.
             for key, value in record.items():
-                key_upper = str(key).upper().replace(" ", "")
-                if "TRI" in key_upper and "NTR" not in key_upper:
+                normalized = str(key).upper().replace(" ", "")
+                if "TRI" in normalized and "NTR" not in normalized:
                     tri_value = value
                     break
 
@@ -486,29 +489,63 @@ def get_nifty_tri_history(index_name, start_date, end_date):
             continue
 
         try:
-            tri_value = float(
-                str(tri_value).replace(",", "").replace("₹", "").strip()
-            )
+            tri_value = float(str(tri_value).replace(",", "").strip())
         except Exception:
             continue
 
-        if tri_value <= 0:
-            continue
-
-        rows.append({"Date": date_value, "TRI": tri_value})
+        if tri_value > 0:
+            rows.append({"Date": date_value, "TRI": tri_value})
 
     if not rows:
-        return None
+        return pd.DataFrame(columns=["Date", "TRI"])
 
     df = pd.DataFrame(rows)
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
     df["TRI"] = pd.to_numeric(df["TRI"], errors="coerce")
     df = df.dropna(subset=["Date", "TRI"])
-    df = df.sort_values("Date")
-    df = df.drop_duplicates("Date", keep="last")
-    df = df.reset_index(drop=True)
+    df = df.sort_values("Date").drop_duplicates("Date", keep="last")
+    return df.reset_index(drop=True)
 
-    return df
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_nifty_tri_history(index_name, start_date, end_date):
+    """Fetch Nifty TRI history for any requested period using <=365-day chunks."""
+    start = pd.Timestamp(start_date).normalize()
+    end = pd.Timestamp(end_date).normalize()
+
+    if start >= end:
+        return None
+
+    chunks = []
+    chunk_start = start
+
+    while chunk_start < end:
+        chunk_end = min(chunk_start + pd.Timedelta(days=364), end)
+        chunk_df = _get_nifty_tri_chunk(
+            index_name,
+            chunk_start.strftime("%Y-%m-%d"),
+            chunk_end.strftime("%Y-%m-%d"),
+        )
+        if not chunk_df.empty:
+            chunks.append(chunk_df)
+        chunk_start = chunk_end + pd.Timedelta(days=1)
+
+    if not chunks:
+        return None
+
+    df = pd.concat(chunks, ignore_index=True)
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df["TRI"] = pd.to_numeric(df["TRI"], errors="coerce")
+    df = (
+        df.dropna(subset=["Date", "TRI"])
+        .sort_values("Date")
+        .drop_duplicates("Date", keep="last")
+        .reset_index(drop=True)
+    )
+
+    # Restrict exactly to the user's selected period.
+    df = df[(df["Date"] >= start) & (df["Date"] <= end)].reset_index(drop=True)
+    return df if len(df) >= 2 else None
 
 
 def calculate_benchmark_growth(tri_df, investment_amount):
